@@ -94,13 +94,15 @@ trigger-scheduler-compose-scheduler-deploy() {
   fi
 
   # collect services and mark which are external (may map to already-running instances)
+  # Columns: service_name, is_external, datastore_spec
   local SERVICE_LINES
   SERVICE_LINES=$(jq -r '
     (.services // {}) | to_entries[]
     | select((.value.labels["com.dokku.compose"] // "true") != "false")
     | [
         .key,
-        ((.value.labels["com.dokku.external"] // "false") == "true")
+        ((.value.labels["com.dokku.external"] // "false") == "true"),
+        (.value.labels["com.dokku.datastore"] // "")
       ]
     | @tsv
   ' "$TMP_JSON" 2>/dev/null || true)
@@ -111,17 +113,48 @@ trigger-scheduler-compose-scheduler-deploy() {
 
   local SERVICES=()
   local EXTERNAL_EXISTING_SERVICES=()
-  local svc_name is_external existing_id
-  while IFS=$'\t' read -r svc_name is_external; do
+  local svc_name is_external datastore_spec existing_id
+  while IFS=$'\t' read -r svc_name is_external datastore_spec; do
     [[ -z "$svc_name" ]] && continue
 
     if [[ "$is_external" == "true" ]]; then
-      # If a container with this service name is already running, reuse it and
-      # just attach it to the compose project network. Otherwise, let compose
-      # create and run it as usual.
-      existing_id="$("$docker_bin" ps -q --filter "name=^${svc_name}$" 2>/dev/null || true)"
+      # External service handling:
+      # 1. If com.dokku.datastore=<type>:<name> указан, пробуем найти инстанс плагина Dokku
+      #    (например dokku.postgres.<name> или dokku.redis.<name>).
+      # 2. Если не нашли или лейбла нет, пробуем найти контейнер по имени сервиса.
+
+      existing_id=""
+
+      if [[ -n "$datastore_spec" ]]; then
+        local ds_type ds_name ds_container_name
+        ds_type="${datastore_spec%%:*}"
+        ds_name="${datastore_spec#*:}"
+
+        case "$ds_type" in
+          postgres)
+            ds_container_name="dokku.postgres.${ds_name}"
+            ;;
+          redis)
+            ds_container_name="dokku.redis.${ds_name}"
+            ;;
+          *)
+            ds_container_name=""
+            ;;
+        esac
+
+        if [[ -n "$ds_container_name" ]]; then
+          existing_id="$("$docker_bin" ps -q --filter "name=^${ds_container_name}$" 2>/dev/null || true)"
+        fi
+      fi
+
+      # Fallback: ищем контейнер по имени сервиса (например, отдельная Dokku-аппа или произвольный контейнер)
+      if [[ -z "$existing_id" ]]; then
+        existing_id="$("$docker_bin" ps -q --filter "name=^${svc_name}$" 2>/dev/null || true)"
+      fi
+
       if [[ -n "$existing_id" ]]; then
-        EXTERNAL_EXISTING_SERVICES+=("$svc_name")
+        # Храним пару service_name:container_id для последующего подключения к сети
+        EXTERNAL_EXISTING_SERVICES+=("${svc_name}:${existing_id}")
         continue
       fi
     fi
@@ -148,9 +181,10 @@ trigger-scheduler-compose-scheduler-deploy() {
       "$docker_bin" network create "$PROJECT_NETWORK" >/dev/null 2>&1 || true
     fi
 
-    local ext_svc
-    for ext_svc in "${EXTERNAL_EXISTING_SERVICES[@]}"; do
-      existing_id="$("$docker_bin" ps -q --filter "name=^${ext_svc}$" 2>/dev/null || true)"
+    local ext_entry ext_svc
+    for ext_entry in "${EXTERNAL_EXISTING_SERVICES[@]}"; do
+      ext_svc="${ext_entry%%:*}"
+      existing_id="${ext_entry#*:}"
       if [[ -n "$existing_id" ]]; then
         # Проверяем, не присоединён ли контейнер уже к нужной сети
         local already_attached=false

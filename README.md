@@ -94,7 +94,7 @@ On deploy, the plugin will:
         com.dokku.compose: "false"
   ```
 - **External services (reuse existing instances)**:
-  - To **reuse an already-running instance** (for example, existing Weaviate or Ollama), mark the service as external:
+  - To **reuse an already-running instance** (for example, an existing Weaviate/Ollama or a Dokku datastore), mark the service as external:
 
   ```yaml
   services:
@@ -104,10 +104,34 @@ On deploy, the plugin will:
         com.dokku.external: "true"
   ```
 
-  - Поведение:
-    - при деплое плагин проверяет, есть ли уже запущенный контейнер с именем сервиса (например, `weaviate`, `ollama`);
-    - если контейнер **есть**, он **не создаётся заново**, а просто **подключается к сети** compose‑проекта (`<project>_default`);
-    - если контейнера **нет**, сервис попадает в список, который запускает `docker compose up -d`, и создаётся как обычный compose‑сервис в той же сети.
+  - Behavior:
+    - on deploy, the plugin checks if there is already a running container with the service name (for example `weaviate`, `ollama`);
+    - if such container **exists**, it is **not recreated**, only **attached to the compose project network** (`<project>_default`);
+    - if there is **no container**, the service is included in the list passed to `docker compose up -d` and is created as a normal compose service in the same network.
+
+- **External Dokku datastore instances (postgres / redis)**:
+  - You can explicitly tell the plugin that an external service corresponds to a Dokku datastore instance via the `com.dokku.datastore` label:
+
+  ```yaml
+  services:
+    db:
+      image: postgres:15
+      labels:
+        com.dokku.external: "true"
+        com.dokku.datastore: "postgres:mydb"  # dokku postgres:create mydb
+
+    cache:
+      image: redis:7
+      labels:
+        com.dokku.external: "true"
+        com.dokku.datastore: "redis:mycache"  # dokku redis:create mycache
+  ```
+
+  - Logic:
+    - `postgres:mydb` → expects a container `dokku.postgres.mydb` (created by the `dokku-postgres` plugin);
+    - `redis:mycache` → expects a container `dokku.redis.mycache` (created by the `dokku-redis` plugin);
+    - if such a container is already running, it is **not recreated**, only attached to the `<project>_default` network;
+    - if no such container is found, the plugin treats the service as a normal external one and lets `docker compose up -d` create it by the compose service name, so the deploy does not break.
 
 - **Volumes**:
   - Host bind-mounts must use **absolute** paths.
