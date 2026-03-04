@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# Simple check that docker compose v2 is available
+fn-is-compose-installed() {
+  local docker_bin="${DOCKER_BIN:-docker}"
+
+  if ! command -v "$docker_bin" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if ! "$docker_bin" compose version >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 0
+}
+
+trigger-builder-compose-builder-build() {
+  declare desc="builder-compose builder-build plugin trigger"
+  declare trigger="builder-build"
+  declare BUILDER_TYPE="$1" APP="$2" SOURCECODE_WORK_DIR="$3"
+
+  # only handle compose builder type
+  if [[ "$BUILDER_TYPE" != "compose" ]]; then
+    return
+  fi
+
+  verify_app_name "$APP"
+
+  if ! fn-is-compose-installed; then
+    dokku_log_fail "Docker Compose v2 plugin is not installed. Please install the docker compose plugin (\"docker compose\") to use the compose builder."
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    dokku_log_fail "The builder-compose plugin requires 'jq' to be installed on the Dokku host."
+  fi
+
+  # resolve compose file
+  local COMPOSE_PATH
+  COMPOSE_PATH="$(fn-plugin-property-get "builder-compose" "$APP" "compose-path")"
+
+  local CANDIDATES=()
+  if [[ -n "$COMPOSE_PATH" ]]; then
+    CANDIDATES+=("$COMPOSE_PATH")
+  fi
+  CANDIDATES+=("docker-compose.yml" "docker-compose.yaml" "compose.yml" "compose.yaml")
+
+  local COMPOSE_FILE=""
+  local candidate
+  for candidate in "${CANDIDATES[@]}"; do
+    if [[ "$candidate" = /* ]]; then
+      # absolute path
+      if [[ -f "$candidate" ]]; then
+        COMPOSE_FILE="$candidate"
+        break
+      fi
+    else
+      # path relative to source code work dir
+      if [[ -f "$SOURCECODE_WORK_DIR/$candidate" ]]; then
+        COMPOSE_FILE="$SOURCECODE_WORK_DIR/$candidate"
+        break
+      fi
+    fi
+  done
+
+  if [[ -z "$COMPOSE_FILE" ]]; then
+    dokku_log_fail "No docker compose file found. Looked for builder-compose:compose-path, docker-compose.yml/.yaml, compose.yml/.yaml in $SOURCECODE_WORK_DIR"
+  fi
+
+  local COMPOSE_DIR
+  COMPOSE_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
+
+  local PROJECT_NAME="dokku-${APP}"
+
+  pushd "$COMPOSE_DIR" >/dev/null
+
+  # generate normalized compose config as json for validation
+  local TMP_JSON
+  TMP_JSON=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_JSON' >/dev/null" RETURN INT TERM EXIT
+
+  if ! "$DOCKER_BIN" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" config --format json >"$TMP_JSON"; then
+    dokku_log_fail "Failed to parse compose file at $COMPOSE_FILE"
+  fi
+
+  # validate that there are no relative bind-mount host paths
+  local INVALID_BIND_PATHS
+  INVALID_BIND_PATHS=$(jq -r '
+    (.services // {}) | to_entries[]
+    | .value.volumes // []
+    | map(select(.type == "bind"))[]
+    | .source // ""
+    | select(. != "" and (startswith("/") | not))
+  ' "$TMP_JSON" 2>/dev/null || true)
+
+  if [[ -n "$INVALID_BIND_PATHS" ]]; then
+    dokku_log_fail "builder-compose does not support relative host paths in bind mounts. Offending paths: $INVALID_BIND_PATHS"
+  fi
+
+  # collect services that should be built
+  local SERVICE_LINES
+  SERVICE_LINES=$(jq -r '
+    (.services // {}) | to_entries[]
+    | select(.value.build != null)
+    | select((.value.labels["com.dokku.compose"] // "true") != "false")
+    | [
+        .key,
+        (.value.build.context // "."),
+        ( .key == "web" or ((.value.labels["com.dokku.primary-image"] // "false") == "true") )
+      ]
+    | @tsv
+  ' "$TMP_JSON" 2>/dev/null || true)
+
+  if [[ -z "$SERVICE_LINES" ]]; then
+    dokku_log_fail "No buildable services found in compose file for app $APP"
+  fi
+
+  local SERVICES=()
+  local PRIMARY_SERVICE=""
+
+  while IFS=$'\t' read -r svc_name svc_context svc_primary; do
+    [[ -z "$svc_name" ]] && continue
+    SERVICES+=("$svc_name")
+  done <<<"$SERVICE_LINES"
+
+  # determine primary service (prefer web, else any with primary-image label)
+  while IFS=$'\t' read -r svc_name svc_context svc_primary; do
+    if [[ "$svc_name" == "web" ]]; then
+      PRIMARY_SERVICE="$svc_name"
+      break
+    fi
+    if [[ "$svc_primary" == "true" ]] && [[ -z "$PRIMARY_SERVICE" ]]; then
+      PRIMARY_SERVICE="$svc_name"
+    fi
+  done <<<"$SERVICE_LINES"
+
+  if [[ -z "$PRIMARY_SERVICE" ]]; then
+    dokku_log_fail "Unable to determine primary service. Define a service named 'web' or label one with 'com.dokku.primary-image=true'."
+  fi
+
+  # build services via docker compose
+  dokku_log_info1 "Building $APP via docker compose (services: ${SERVICES[*]})"
+
+  local BUILD_ARGS=()
+  local BUILDX
+  BUILDX="$(fn-plugin-property-get "builder-compose" "$APP" "buildx")"
+  if [[ "$BUILDX" == "true" ]]; then
+    export DOCKER_BUILDKIT=1
+  fi
+
+  if ! "$DOCKER_BIN" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" build "${SERVICES[@]}"; then
+    dokku_log_fail "docker compose build failed for app $APP"
+  fi
+
+  # retag built images into dokku/$APP namespace
+  local svc
+  local has_latest=false
+  for svc in "${SERVICES[@]}"; do
+    local SRC_IMAGE="${PROJECT_NAME}-${svc}:latest"
+    local TARGET_IMAGE="dokku/$APP:latest-${svc}"
+
+    if ! verify_image "$SRC_IMAGE"; then
+      dokku_log_fail "Expected image $SRC_IMAGE not found after compose build"
+    fi
+
+    "$DOCKER_BIN" image tag "$SRC_IMAGE" "$TARGET_IMAGE"
+
+    if [[ "$svc" == "$PRIMARY_SERVICE" ]]; then
+      local PRIMARY_TAG="dokku/$APP:latest"
+      "$DOCKER_BIN" image tag "$SRC_IMAGE" "$PRIMARY_TAG"
+      has_latest=true
+    fi
+  done
+
+  if [[ "$has_latest" != "true" ]]; then
+    dokku_log_fail "builder-compose was unable to create a primary dokku/$APP:latest image"
+  fi
+
+  popd >/dev/null
+}
+
+trigger-builder-compose-builder-build "$@"
+
+

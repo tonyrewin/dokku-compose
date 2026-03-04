@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+trigger-builder-compose-builder-release() {
+  declare desc="builder-compose builder-release plugin trigger"
+  declare trigger="builder-release"
+  declare BUILDER_TYPE="$1" APP="$2" IMAGE_TAG="$3"
+
+  # only handle compose builder type
+  if [[ "$BUILDER_TYPE" != "compose" ]]; then
+    return
+  fi
+
+  # For now, this trigger is a no-op as images are already tagged in the dokku/$APP namespace
+  # during the builder-build step. This exists to conform to the builder interface.
+  :
+}
+
+trigger-builder-compose-builder-release "$@"
+
+

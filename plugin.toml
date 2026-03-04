@@ -1,0 +1,7 @@
+[plugin]
+description = "Dokku builder/scheduler plugin for Docker Compose v2"
+version = "0.1.0"
+
+[plugin.config]
+
+
