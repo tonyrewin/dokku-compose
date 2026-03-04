@@ -107,6 +107,7 @@ trigger-builder-compose-builder-build() {
     (.services // {}) | to_entries[]
     | select(.value.build != null)
     | select((.value.labels["com.dokku.compose"] // "true") != "false")
+    | select((.value.labels["com.dokku.external"] // "false") != "true")
     | [
         .key,
         (.value.build.context // "."),

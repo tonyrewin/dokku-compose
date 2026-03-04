@@ -93,6 +93,21 @@ On deploy, the plugin will:
       labels:
         com.dokku.compose: "false"
   ```
+- **External services (reuse existing instances)**:
+  - To **reuse an already-running instance** (for example, existing Weaviate or Ollama), mark the service as external:
+
+  ```yaml
+  services:
+    weaviate:
+      image: semitechnologies/weaviate:latest
+      labels:
+        com.dokku.external: "true"
+  ```
+
+  - Поведение:
+    - при деплое плагин проверяет, есть ли уже запущенный контейнер с именем сервиса (например, `weaviate`, `ollama`);
+    - если контейнер **есть**, он **не создаётся заново**, а просто **подключается к сети** compose‑проекта (`<project>_default`);
+    - если контейнера **нет**, сервис попадает в список, который запускает `docker compose up -d`, и создаётся как обычный compose‑сервис в той же сети.
 
 - **Volumes**:
   - Host bind-mounts must use **absolute** paths.

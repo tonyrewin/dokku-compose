@@ -34,6 +34,10 @@ trigger-scheduler-compose-scheduler-deploy() {
     dokku_log_fail "Docker Compose v2 plugin is not installed. Please install the docker compose plugin (\"docker compose\") to use the compose scheduler."
   fi
 
+  if ! command -v jq >/dev/null 2>&1; then
+    dokku_log_fail "The scheduler-compose plugin requires 'jq' to be installed on the Dokku host."
+  fi
+
   # resolve compose file: prefer scheduler-compose:compose-path, fall back to builder-compose:compose-path,
   # then standard names in the app repo.
   local COMPOSE_PATH
@@ -71,20 +75,99 @@ trigger-scheduler-compose-scheduler-deploy() {
     dokku_log_fail "No docker compose file found for app $APP in $APP_ROOT"
   fi
 
-  local COMPOSE_DIR
-  COMPOSE_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
-
   local PROJECT_NAME
   PROJECT_NAME="$(fn-plugin-property-get "scheduler-compose" "$APP" "project-name")"
   [[ -z "$PROJECT_NAME" ]] && PROJECT_NAME="dokku-${APP}"
+  local PROJECT_NETWORK="${PROJECT_NAME}_default"
 
-  dokku_log_info1 "Deploying $APP via docker compose scheduler (project: $PROJECT_NAME)"
+  local COMPOSE_DIR
+  COMPOSE_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
+
+  # generate normalized compose config as json
+  local TMP_JSON
+  TMP_JSON=$(mktemp "/tmp/dokku-${DOKKU_PID:-$$}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_JSON' >/dev/null" RETURN INT TERM EXIT
+
+  local docker_bin="${DOCKER_BIN:-docker}"
+  if ! "$docker_bin" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" config --format json >"$TMP_JSON"; then
+    dokku_log_fail "Failed to parse compose file at $COMPOSE_FILE"
+  fi
+
+  # collect services and mark which are external (may map to already-running instances)
+  local SERVICE_LINES
+  SERVICE_LINES=$(jq -r '
+    (.services // {}) | to_entries[]
+    | select((.value.labels["com.dokku.compose"] // "true") != "false")
+    | [
+        .key,
+        ((.value.labels["com.dokku.external"] // "false") == "true")
+      ]
+    | @tsv
+  ' "$TMP_JSON" 2>/dev/null || true)
+
+  if [[ -z "$SERVICE_LINES" ]]; then
+    dokku_log_fail "No runnable services found in compose file for app $APP"
+  fi
+
+  local SERVICES=()
+  local EXTERNAL_EXISTING_SERVICES=()
+  local svc_name is_external existing_id
+  while IFS=$'\t' read -r svc_name is_external; do
+    [[ -z "$svc_name" ]] && continue
+
+    if [[ "$is_external" == "true" ]]; then
+      # If a container with this service name is already running, reuse it and
+      # just attach it to the compose project network. Otherwise, let compose
+      # create and run it as usual.
+      existing_id="$("$docker_bin" ps -q --filter "name=^${svc_name}$" 2>/dev/null || true)"
+      if [[ -n "$existing_id" ]]; then
+        EXTERNAL_EXISTING_SERVICES+=("$svc_name")
+        continue
+      fi
+    fi
+
+    SERVICES+=("$svc_name")
+  done <<<"$SERVICE_LINES"
+
+  if [[ "${#SERVICES[@]}" -eq 0 ]]; then
+    dokku_log_fail "No services scheduled to run for app $APP (after resolving external services)"
+  fi
+
+  dokku_log_info1 "Deploying $APP via docker compose scheduler (project: $PROJECT_NAME, services: ${SERVICES[*]})"
 
   pushd "$COMPOSE_DIR" >/dev/null
-  if ! "$DOCKER_BIN" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d; then
+  if ! "$docker_bin" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d "${SERVICES[@]}"; then
     dokku_log_fail "docker compose up failed for app $APP"
   fi
   popd >/dev/null
+
+  # Ensure existing external services are attached to the compose project network
+  if [[ "${#EXTERNAL_EXISTING_SERVICES[@]}" -gt 0 ]]; then
+    # Network will have been created by docker compose up; if not, try to create it.
+    if ! "$docker_bin" network inspect "$PROJECT_NETWORK" >/dev/null 2>&1; then
+      "$docker_bin" network create "$PROJECT_NETWORK" >/dev/null 2>&1 || true
+    fi
+
+    local ext_svc
+    for ext_svc in "${EXTERNAL_EXISTING_SERVICES[@]}"; do
+      existing_id="$("$docker_bin" ps -q --filter "name=^${ext_svc}$" 2>/dev/null || true)"
+      if [[ -n "$existing_id" ]]; then
+        # Проверяем, не присоединён ли контейнер уже к нужной сети
+        local already_attached=false
+        if "$docker_bin" inspect "$existing_id" >/dev/null 2>&1; then
+          if "$docker_bin" inspect "$existing_id" -f '{{json .NetworkSettings.Networks}}' 2>/dev/null \
+            | jq -e --arg net "$PROJECT_NETWORK" 'has($net)' >/dev/null 2>&1; then
+            already_attached=true
+          fi
+        fi
+
+        if [[ "$already_attached" != "true" ]]; then
+          "$docker_bin" network connect "$PROJECT_NETWORK" "$existing_id" >/dev/null 2>&1 || true
+          dokku_log_info2 "Attached existing external service '$ext_svc' to network '$PROJECT_NETWORK'"
+        fi
+      fi
+    done
+  fi
 
   # We don't currently know the bound port/ip for the primary web service here,
   # so pass empty values as is done in other schedulers when that information
