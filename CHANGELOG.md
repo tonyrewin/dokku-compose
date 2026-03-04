@@ -1,5 +1,16 @@
 ## Changelog
 
+### 0.1.3
+
+- Игнорирование сервисов LetsEncrypt/Certbot на уровне builder и scheduler:
+  - сервисы с именами `letsencrypt` или `certbot`;
+  - сервисы с лейблами `com.dokku.letsencrypt: "true"` или `com.dokku.certbot: "true"`.
+  Это гарантирует, что сертификатами управляет только внутренний плагин Dokku `letsencrypt`, а не docker-compose.
+- Добавлены дополнительные триггеры шедулера для режима `DOKKU_SCHEDULER=compose`:
+  - `scheduler-destroy` — выполняет `docker compose down` для проекта приложения;
+  - `scheduler-ps` — проксирует `docker compose ps` для просмотра процессов/контейнеров;
+  - `scheduler-run` — выполняет one-off команды через `docker compose run --rm` (использует `PROCESS_TYPE` как имя сервиса, по умолчанию `web`).
+
 ### 0.1.2
 
 - Поддержка внешних инстансов плагинов Dokku (`dokku-postgres`, `dokku-redis`) через лейбл `com.dokku.datastore`:

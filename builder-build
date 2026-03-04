@@ -106,6 +106,10 @@ trigger-builder-compose-builder-build() {
   SERVICE_LINES=$(jq -r '
     (.services // {}) | to_entries[]
     | select(.value.build != null)
+    # skip services that are meant to be handled by Dokku''s internal letsencrypt plugin
+    | select(.key != "letsencrypt" and .key != "certbot")
+    | select((.value.labels["com.dokku.letsencrypt"] // "false") != "true")
+    | select((.value.labels["com.dokku.certbot"] // "false") != "true")
     | select((.value.labels["com.dokku.compose"] // "true") != "false")
     | select((.value.labels["com.dokku.external"] // "false") != "true")
     | [

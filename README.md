@@ -136,14 +136,16 @@ On deploy, the plugin will:
 - **Volumes**:
   - Host bind-mounts must use **absolute** paths.
   - Relative host paths in bind mounts are rejected with a clear error message.
+- **LetsEncrypt / Certbot**:
+  - Certificate management is expected to be handled by Dokku's own `letsencrypt` plugin.
+  - Services that are clearly LetsEncrypt/Certbot helpers are **ignored** by the compose builder and scheduler:
+    - services named `letsencrypt` or `certbot`;
+    - or services labeled `com.dokku.letsencrypt: "true"` or `com.dokku.certbot: "true"`.
+  - This ensures there are no conflicting certbot instances started by the compose integration itself.
 
 ### Uninstall
 
-```bash
-sudo dokku plugin:uninstall dokku-compose
-```
-
-### License
+```bash  ense
 
 This project is licensed under the **MIT License** – see [`LICENSE`](LICENSE) for details.
 

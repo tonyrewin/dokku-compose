@@ -98,6 +98,10 @@ trigger-scheduler-compose-scheduler-deploy() {
   local SERVICE_LINES
   SERVICE_LINES=$(jq -r '
     (.services // {}) | to_entries[]
+    # skip services that are meant to be handled by Dokku''s internal letsencrypt plugin
+    | select(.key != "letsencrypt" and .key != "certbot")
+    | select((.value.labels["com.dokku.letsencrypt"] // "false") != "true")
+    | select((.value.labels["com.dokku.certbot"] // "false") != "true")
     | select((.value.labels["com.dokku.compose"] // "true") != "false")
     | [
         .key,

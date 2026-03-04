@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# Simple check that docker compose v2 is available
+fn-is-compose-installed() {
+  local docker_bin="${DOCKER_BIN:-docker}"
+
+  if ! command -v "$docker_bin" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if ! "$docker_bin" compose version >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 0
+}
+
+trigger-scheduler-compose-scheduler-destroy() {
+  declare desc="scheduler-compose scheduler-destroy plugin trigger"
+  declare trigger="scheduler-destroy"
+
+  # Dokku usually passes: SCHEDULER APP IMAGE_TAG PROCESS_TYPE (and possibly extras).
+  # We only really need the scheduler name and app here.
+  local DOKKU_SCHEDULER="$1" APP="$2"
+
+  if [[ "$DOKKU_SCHEDULER" != "compose" ]]; then
+    return
+  fi
+
+  verify_app_name "$APP"
+
+  if ! fn-is-compose-installed; then
+    dokku_log_fail "Docker Compose v2 plugin is not installed. Please install the docker compose plugin (\"docker compose\") to use the compose scheduler."
+  fi
+
+  # resolve compose file: prefer scheduler-compose:compose-path, fall back to builder-compose:compose-path,
+  # then standard names in the app repo.
+  local COMPOSE_PATH
+  COMPOSE_PATH="$(fn-plugin-property-get "scheduler-compose" "$APP" "compose-path")"
+  if [[ -z "$COMPOSE_PATH" ]]; then
+    COMPOSE_PATH="$(fn-plugin-property-get "builder-compose" "$APP" "compose-path")"
+  fi
+
+  local APP_ROOT="$DOKKU_ROOT/$APP"
+  local CANDIDATES=()
+  if [[ -n "$COMPOSE_PATH" ]]; then
+    CANDIDATES+=("$COMPOSE_PATH")
+  fi
+  CANDIDATES+=("docker-compose.yml" "docker-compose.yaml" "compose.yml" "compose.yaml")
+
+  local COMPOSE_FILE=""
+  local candidate
+  for candidate in "${CANDIDATES[@]}"; do
+    if [[ "$candidate" = /* ]]; then
+      # absolute path
+      if [[ -f "$candidate" ]]; then
+        COMPOSE_FILE="$candidate"
+        break
+      fi
+    else
+      # path relative to app root
+      if [[ -f "$APP_ROOT/$candidate" ]]; then
+        COMPOSE_FILE="$APP_ROOT/$candidate"
+        break
+      fi
+    fi
+  done
+
+  if [[ -z "$COMPOSE_FILE" ]]; then
+    # If there is no compose file anymore, nothing to destroy.
+    dokku_log_info1 "No docker compose file found for app $APP, nothing to destroy"
+    return 0
+  fi
+
+  local PROJECT_NAME
+  PROJECT_NAME="$(fn-plugin-property-get "scheduler-compose" "$APP" "project-name")"
+  [[ -z "$PROJECT_NAME" ]] && PROJECT_NAME="dokku-${APP}"
+
+  local docker_bin="${DOCKER_BIN:-docker}"
+  local COMPOSE_DIR
+  COMPOSE_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
+
+  dokku_log_info1 "Destroying compose project for app $APP (project: $PROJECT_NAME)"
+
+  pushd "$COMPOSE_DIR" >/dev/null
+  # We intentionally do a full `down` for the project. External services that were only
+  # attached to the network are not removed by this call.
+  if ! "$docker_bin" compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" down >/dev/null 2>&1; then
+    dokku_log_fail "docker compose down failed for app $APP"
+  fi
+  popd >/dev/null
+}
+
+trigger-scheduler-compose-scheduler-destroy "$@"
+
+
